@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="VirtualBotApplication/VirtualBotApplication.vcxproj" Id="2d04e228-33ed-4e0c-88eb-e4ee7196706b" />
+</Solution>

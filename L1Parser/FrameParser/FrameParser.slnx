@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="FrameParser/FrameParser.vcxproj" Id="76330b57-238b-4dc4-a9cb-7fc9fd30a42e" />
+</Solution>
