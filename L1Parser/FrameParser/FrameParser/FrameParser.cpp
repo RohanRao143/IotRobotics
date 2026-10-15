@@ -171,105 +171,348 @@ void SerialWorkerThread() {
     CloseHandle(hSerial);
 }
 
-// --- The Multithreaded Network Routing Engine ---
-void NetworkRoutingThread() {
+
+// --- Helper: send an entire TCP frame, handling partial writes ---
+bool send_all(SOCKET client, const std::vector<uint8_t>& buffer)
+{
+    size_t offset = 0;
+
+    while (offset < buffer.size())
+    {
+        int remaining = static_cast<int>(buffer.size() - offset);
+
+        int sent = send(
+            client,
+            reinterpret_cast<const char*>(buffer.data() + offset),
+            remaining,
+            0
+        );
+
+        if (sent == SOCKET_ERROR || sent == 0)
+        {
+            return false;
+        }
+
+        offset += static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+
+// --- Network Routing Engine: UDP + TCP ---
+void NetworkRoutingThread()
+{
     // 1. Boot Winsock context blocks
     WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        std::cerr << "[Network] ERROR: WSAStartup failed.\n";
+        return;
+    }
 
-    // 2. Provision Ultra-Low Latency UDP Socket Configuration
+    // ---------------------------------------------------------
+    // 1. UDP socket: telemetry destination
+    // ---------------------------------------------------------
     SOCKET udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in udp_dest;
+
+    if (udp_socket == INVALID_SOCKET)
+    {
+        std::cerr << "[Network] ERROR: UDP socket creation failed.\n";
+        WSACleanup();
+        return;
+    }
+
+    sockaddr_in udp_dest{};
     udp_dest.sin_family = AF_INET;
-    udp_dest.sin_port = htons(5555); // Streaming low-latency metrics out to Port 5555
+    udp_dest.sin_port = htons(5555);
     inet_pton(AF_INET, "127.0.0.1", &udp_dest.sin_addr);
 
-    // 3. Provision Reliable Command Loop TCP Configuration
-    SOCKET tcp_listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in tcp_srv_addr;
+
+    // ---------------------------------------------------------
+    // 2. TCP listening socket: client connections
+    // ---------------------------------------------------------
+    SOCKET tcp_listen_socket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        IPPROTO_TCP
+    );
+
+    if (tcp_listen_socket == INVALID_SOCKET)
+    {
+        std::cerr << "[Network] ERROR: TCP socket creation failed.\n";
+        closesocket(udp_socket);
+        WSACleanup();
+        return;
+    }
+
+    sockaddr_in tcp_srv_addr{};
     tcp_srv_addr.sin_family = AF_INET;
-    tcp_srv_addr.sin_port = htons(6666); // Commands server bound to Port 6666
-    tcp_srv_addr.sin_addr.s_addr = INADDR_ANY;
+    tcp_srv_addr.sin_port = htons(6666);
+    tcp_srv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    // Bind and switch TCP to non-blocking or simple drop acceptance architecture
-    bind(tcp_listen_socket, (sockaddr*)&tcp_srv_addr, sizeof(tcp_srv_addr));
-    listen(tcp_listen_socket, SOMAXCONN);
+    if (bind(
+        tcp_listen_socket,
+        reinterpret_cast<sockaddr*>(&tcp_srv_addr),
+        sizeof(tcp_srv_addr)) == SOCKET_ERROR)
+    {
+        std::cerr << "[Network] ERROR: TCP bind failed: "
+                  << WSAGetLastError() << '\n';
 
-    // Configure server architecture for non-blocking acceptance loops
-    u_long mode = 1;
-    ioctlsocket(tcp_listen_socket, FIONBIO, &mode);
+        closesocket(tcp_listen_socket);
+        closesocket(udp_socket);
+        WSACleanup();
+        return;
+    }
+
+    if (listen(tcp_listen_socket, SOMAXCONN) == SOCKET_ERROR)
+    {
+        std::cerr << "[Network] ERROR: TCP listen failed: "
+                  << WSAGetLastError() << '\n';
+
+        closesocket(tcp_listen_socket);
+        closesocket(udp_socket);
+        WSACleanup();
+        return;
+    }
+
+    // Non-blocking accept: the coordinator can continue routing
+    // telemetry when no new TCP client is connecting.
+    u_long nonblocking = 1;
+
+    if (ioctlsocket(
+        tcp_listen_socket,
+        FIONBIO,
+        &nonblocking) == SOCKET_ERROR)
+    {
+        std::cerr << "[Network] ERROR: Cannot configure TCP listener.\n";
+
+        closesocket(tcp_listen_socket);
+        closesocket(udp_socket);
+        WSACleanup();
+        return;
+    }
+
     SOCKET connected_tcp_client = INVALID_SOCKET;
 
-    std::cout << "[Network] 🚀 Engine operational. UDP Broadcast: 5555 | TCP Listen: 6666\n";
+    std::cout
+        << "[Network] Engine operational.\n"
+        << "[Network] UDP telemetry: 127.0.0.1:5555\n"
+        << "[Network] TCP listener: 0.0.0.0:6666\n";
 
-    std::vector<uint8_t> tx_wire_buffer;
 
-    while (running) {
-        // Asynchronously check for incoming client command attachments without stalling loops
-        if (connected_tcp_client == INVALID_SOCKET) {
-            sockaddr_in client_addr;
-            int addr_len = sizeof(client_addr);
-            connected_tcp_client = accept(tcp_listen_socket, (sockaddr*)&client_addr, &addr_len);
-            if (connected_tcp_client != INVALID_SOCKET) {
-                std::cout << "[Network] 🔌 Master Controller Connected via TCP.\n";
-            }
-        }
-
-        bool queue_empty = true;
-        ParsedFrame frame_to_route;
-
-        // Thread safe inspection of work blocks queue
+    // ---------------------------------------------------------
+    // 3. Routing loop
+    // ---------------------------------------------------------
+    while (running)
+    {
+        // Accept one TCP client.
+        // Multi-client fan-out will be added in Task #4.
+        if (connected_tcp_client == INVALID_SOCKET)
         {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            if (!network_queue.empty()) {
-                frame_to_route = network_queue.front();
-                network_queue.pop();
-                queue_empty = false;
+            sockaddr_in client_addr{};
+            int addr_len = sizeof(client_addr);
+
+            SOCKET accepted = accept(
+                tcp_listen_socket,
+                reinterpret_cast<sockaddr*>(&client_addr),
+                &addr_len
+            );
+
+            if (accepted != INVALID_SOCKET)
+            {
+                // Explicitly configure the accepted socket as blocking.
+                u_long blocking = 0;
+
+                if (ioctlsocket(
+                    accepted,
+                    FIONBIO,
+                    &blocking) == SOCKET_ERROR)
+                {
+                    std::cerr
+                        << "[Network] ERROR: Cannot configure client socket.\n";
+
+                    closesocket(accepted);
+                }
+                else
+                {
+                    connected_tcp_client = accepted;
+
+                    std::cout
+                        << "[Network] TCP client connected.\n";
+                }
             }
-        }
+            else
+            {
+                int error = WSAGetLastError();
 
-        if (!queue_empty) {
-            // Reconstruct complete layout package for raw network transmission
-            uint16_t len_net = htons(frame_to_route.payload.size());
-            uint16_t crc_net = htons(frame_to_route.crc);
-
-            tx_wire_buffer.clear();
-            tx_wire_buffer.push_back(0xAA);
-            tx_wire_buffer.push_back(frame_to_route.msg_type);
-            tx_wire_buffer.push_back((uint8_t)(len_net >> 8));
-            tx_wire_buffer.push_back((uint8_t)(len_net & 0xFF));
-            tx_wire_buffer.insert(tx_wire_buffer.end(), frame_to_route.payload.begin(), frame_to_route.payload.end());
-            tx_wire_buffer.push_back((uint8_t)(crc_net >> 8));
-            tx_wire_buffer.push_back((uint8_t)(crc_net & 0xFF));
-
-            // MULTITHREADED ROUTING PARADIGM MATRIX:
-            // Route dynamically based on message configurations rules
-            if (frame_to_route.msg_type == 0x02) {
-                // High-Frequency IMU: Fire-and-forget over UDP for zero transmission overhead
-                sendto(udp_socket, (const char*)tx_wire_buffer.data(), tx_wire_buffer.size(), 0, (sockaddr*)&udp_dest, sizeof(udp_dest));
-            }
-            else if (frame_to_route.msg_type == 0x01 || frame_to_route.msg_type == 0x03) {
-                // System Alert / Critical Command Response: Stream via stateful TCP pipe
-                if (connected_tcp_client != INVALID_SOCKET) {
-                    int result = send(connected_tcp_client, (const char*)tx_wire_buffer.data(), tx_wire_buffer.size(), 0);
-                    if (result == SOCKET_ERROR) {
-                        std::cout << "[Network] ⚠️ TCP Client disconnected.\n";
-                        closesocket(connected_tcp_client);
-                        connected_tcp_client = INVALID_SOCKET;
-                    }
+                if (error != WSAEWOULDBLOCK)
+                {
+                    std::cerr
+                        << "[Network] Accept failed: "
+                        << error << '\n';
                 }
             }
         }
-        else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Rest loop when lines run dry
+
+
+        // Retrieve one validated frame from the parser queue.
+        ParsedFrame frame_to_route;
+        bool has_frame = false;
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+
+            if (!network_queue.empty())
+            {
+                frame_to_route = std::move(network_queue.front());
+                network_queue.pop();
+                has_frame = true;
+            }
+        }
+
+        if (!has_frame)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1)
+            );
+
+            continue;
+        }
+
+
+        // -----------------------------------------------------
+        // 4. Serialize the frame using explicit wire byte order
+        // -----------------------------------------------------
+        if (frame_to_route.payload.size() > 65535)
+        {
+            std::cerr << "[Network] ERROR: Payload too large.\n";
+            continue;
+        }
+
+        const uint16_t len =
+            static_cast<uint16_t>(frame_to_route.payload.size());
+
+        // frame_to_route.crc is already a host-order integer.
+        const uint16_t crc = frame_to_route.crc;
+
+        std::vector<uint8_t> tx_wire_buffer;
+        tx_wire_buffer.reserve(4 + len + 2);
+
+        tx_wire_buffer.push_back(0xAA);
+        tx_wire_buffer.push_back(frame_to_route.msg_type);
+
+        // Length: big-endian, independent of host endianness.
+        tx_wire_buffer.push_back(
+            static_cast<uint8_t>((len >> 8) & 0xFF)
+        );
+
+        tx_wire_buffer.push_back(
+            static_cast<uint8_t>(len & 0xFF)
+        );
+
+        tx_wire_buffer.insert(
+            tx_wire_buffer.end(),
+            frame_to_route.payload.begin(),
+            frame_to_route.payload.end()
+        );
+
+        // CRC: big-endian, matching VirtualBot's wire format.
+        tx_wire_buffer.push_back(
+            static_cast<uint8_t>((crc >> 8) & 0xFF)
+        );
+
+        tx_wire_buffer.push_back(
+            static_cast<uint8_t>(crc & 0xFF)
+        );
+
+
+        // -----------------------------------------------------
+        // 5. Route according to message type
+        // -----------------------------------------------------
+
+        // IMU telemetry: publish to BOTH UDP and TCP.
+        if (frame_to_route.msg_type == 0x02)
+        {
+            int udp_result = sendto(
+                udp_socket,
+                reinterpret_cast<const char*>(
+                    tx_wire_buffer.data()),
+                static_cast<int>(tx_wire_buffer.size()),
+                0,
+                reinterpret_cast<sockaddr*>(&udp_dest),
+                sizeof(udp_dest)
+            );
+
+            if (udp_result == SOCKET_ERROR)
+            {
+                std::cerr
+                    << "[Network] UDP send failed: "
+                    << WSAGetLastError() << '\n';
+            }
+            else
+            {
+                std::cout
+                    << "[UDP] IMU frame published: "
+                    << udp_result << " bytes\n";
+            }
+        }
+
+        // System alerts, command responses, and IMU telemetry
+        // are forwarded over TCP when a client is connected.
+        const bool tcp_message =
+            frame_to_route.msg_type == 0x01 ||
+            frame_to_route.msg_type == 0x02 ||
+            frame_to_route.msg_type == 0x03;
+
+        if (tcp_message &&
+            connected_tcp_client != INVALID_SOCKET)
+        {
+            if (send_all(
+                connected_tcp_client,
+                tx_wire_buffer))
+            {
+                std::cout
+                    << "[TCP] Frame type 0x"
+                    << std::hex
+                    << static_cast<int>(frame_to_route.msg_type)
+                    << std::dec
+                    << " sent: "
+                    << tx_wire_buffer.size()
+                    << " bytes\n";
+            }
+            else
+            {
+                int error = WSAGetLastError();
+
+                std::cerr
+                    << "[Network] TCP send failed: "
+                    << error
+                    << ". Removing disconnected client.\n";
+
+                closesocket(connected_tcp_client);
+                connected_tcp_client = INVALID_SOCKET;
+            }
         }
     }
 
-    if (connected_tcp_client != INVALID_SOCKET) closesocket(connected_tcp_client);
-    closesocket(udp_socket);
+
+    // ---------------------------------------------------------
+    // 6. Cleanup
+    // ---------------------------------------------------------
+    if (connected_tcp_client != INVALID_SOCKET)
+    {
+        closesocket(connected_tcp_client);
+    }
+
     closesocket(tcp_listen_socket);
+    closesocket(udp_socket);
+
     WSACleanup();
+
+    std::cout << "[Network] Routing engine stopped.\n";
 }
+
 
 int main() {
     std::cout << "[Main] Starting FrameParser..." << std::endl;
